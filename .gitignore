@@ -1,0 +1,41 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual envs and editor settings
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+
+# Decision Transformer training outputs
+dt_gcs_checkpoint.pt
+dt_gcs_config.json
+training/outputs/
+*.ckpt
+*.pt
+*.pth
+*.log
+
+# Local datasets and generated artifacts
+torch_data_test/
+*.tfrecord
+*.tfrecord-*
+*.npz
+waymo_scenario.png
+dt_inference.png
+
+# Large tutorial sample assets downloaded/generated locally
+tutorial/frames
+tutorial/frame_with_keypoints.tfrecord
+tutorial/frames_with_maps.tfrecord
+tutorial/womd_camera_codebook.npy

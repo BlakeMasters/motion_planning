@@ -1,19 +1,23 @@
+from __future__ import annotations
+
 import argparse
 import json
-import math
-import os
-import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import numpy as np
-import tensorflow as tf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from google.cloud import storage
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2Model
+
+from waymo_data_utils import (
+    DatasetConfig,
+    WOMDOfflineRLDataset,
+    build_tf_dataset,
+    set_seed,
+    validate_gcs_access,
+)
 
 
 @dataclass
@@ -106,290 +110,6 @@ def parse_args() -> TrainConfig:
     cfg.output_ckpt = args.output_ckpt
     cfg.output_config = args.output_config
     return cfg
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def gcs_bucket_from_path(path: str) -> str | None:
-    if not path.startswith("gs://"):
-        return None
-    return path[5:].split("/", 1)[0]
-
-
-def check_gcs_access(bucket: str) -> bool:
-    try:
-        project = (
-            os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or os.environ.get("GCLOUD_PROJECT")
-            or os.environ.get("GCP_PROJECT")
-        )
-        client = storage.Client(project=project) if project else storage.Client()
-        b = client.bucket(bucket)
-        next(client.list_blobs(b, max_results=1))
-        return True
-    except Exception as exc:
-        print(f"GCS not accessible: {exc}")
-        return False
-
-
-def validate_gcs_access(cfg: TrainConfig) -> bool:
-    buckets = sorted(
-        {
-            b
-            for b in (
-                gcs_bucket_from_path(cfg.train_path),
-                gcs_bucket_from_path(cfg.val_path),
-            )
-            if b is not None
-        }
-    )
-    if not buckets:
-        return True
-    return all(check_gcs_access(bucket) for bucket in buckets)
-
-
-def build_features(cfg: TrainConfig) -> dict[str, tf.io.FixedLenFeature]:
-    state_features = {}
-    for split, steps in [("past", cfg.n_past), ("current", cfg.n_current), ("future", cfg.n_future)]:
-        for feat in ["x", "y", "bbox_yaw", "velocity_x", "velocity_y", "valid"]:
-            dtype = tf.int64 if feat == "valid" else tf.float32
-            state_features[f"state/{split}/{feat}"] = tf.io.FixedLenFeature(
-                [cfg.n_agents, steps], dtype
-            )
-
-    for key in ("is_sdc", "type"):
-        dtype = tf.int64 if key == "is_sdc" else tf.float32
-        state_features[f"state/{key}"] = tf.io.FixedLenFeature([cfg.n_agents], dtype)
-    return state_features
-
-
-def list_shards(path: str, n: int) -> list[str]:
-    if path.startswith("gs://"):
-        parts = path[5:].split("/", 1)
-        bucket = parts[0]
-        prefix = parts[1] if len(parts) > 1 else ""
-        client = storage.Client()
-        blobs = list(client.list_blobs(bucket, prefix=prefix, max_results=n * 4))
-        paths = [
-            f"gs://{bucket}/{blob.name}"
-            for blob in blobs
-            if blob.name.endswith(".tfrecord") or "tfrecord" in blob.name
-        ]
-        paths.sort()
-        return paths[:n]
-
-    from glob import glob
-
-    paths = sorted(glob(os.path.join(path, "*.tfrecord*")))
-    return paths[:n]
-
-
-def parse_scenario(raw: bytes, features: dict[str, tf.io.FixedLenFeature]) -> dict[str, tf.Tensor]:
-    ex = tf.io.parse_single_example(raw, features)
-    past = tf.stack(
-        [
-            ex["state/past/x"],
-            ex["state/past/y"],
-            ex["state/past/velocity_x"],
-            ex["state/past/velocity_y"],
-            tf.math.cos(ex["state/past/bbox_yaw"]),
-            tf.math.sin(ex["state/past/bbox_yaw"]),
-        ],
-        axis=-1,
-    )
-    cur = tf.stack(
-        [
-            ex["state/current/x"],
-            ex["state/current/y"],
-            ex["state/current/velocity_x"],
-            ex["state/current/velocity_y"],
-            tf.math.cos(ex["state/current/bbox_yaw"]),
-            tf.math.sin(ex["state/current/bbox_yaw"]),
-        ],
-        axis=-1,
-    )
-    future = tf.stack(
-        [
-            ex["state/future/x"],
-            ex["state/future/y"],
-            ex["state/future/velocity_x"],
-            ex["state/future/velocity_y"],
-            tf.math.cos(ex["state/future/bbox_yaw"]),
-            tf.math.sin(ex["state/future/bbox_yaw"]),
-        ],
-        axis=-1,
-    )
-    fut_valid = tf.concat(
-        [ex["state/past/valid"], ex["state/current/valid"], ex["state/future/valid"]],
-        axis=1,
-    )
-    return {
-        "history": tf.concat([past, cur], axis=1),
-        "future": future,
-        "fut_valid": fut_valid,
-        "is_sdc": ex["state/is_sdc"],
-        "type": ex["state/type"],
-    }
-
-
-def build_tf_dataset(path: str, n_shards: int, cfg: TrainConfig) -> tf.data.Dataset | None:
-    shards = list_shards(path, n_shards)
-    if not shards:
-        return None
-    print(f"Using {len(shards)} shards from {path}")
-    print(f"First shard: {shards[0]}")
-    features = build_features(cfg)
-    ds = (
-        tf.data.TFRecordDataset(shards, num_parallel_reads=4)
-        .map(lambda raw: parse_scenario(raw, features), num_parallel_calls=tf.data.AUTOTUNE)
-        .batch(1)
-        .prefetch(tf.data.AUTOTUNE)
-    )
-    return ds
-
-
-POS_SCALE = 50.0
-VEL_SCALE = 15.0
-ACT_SCALE = 1.5
-K_NEAREST = 5
-
-
-def build_state(hist: np.ndarray, sdc_idx: int) -> np.ndarray:
-    t = hist.shape[1] - 1
-    ego = hist[sdc_idx, t]
-    ex, ey, evx, evy, cosh, sinh = ego
-
-    state = np.zeros((16,), dtype=np.float32)
-    state[0] = ex / POS_SCALE
-    state[1] = ey / POS_SCALE
-    state[2] = cosh
-    state[3] = sinh
-    state[4] = evx / VEL_SCALE
-    state[5] = evy / VEL_SCALE
-
-    others = []
-    for i in range(hist.shape[0]):
-        if i == sdc_idx:
-            continue
-        ox, oy = hist[i, t, 0], hist[i, t, 1]
-        if ox == 0 and oy == 0:
-            continue
-        dist = math.sqrt((ox - ex) ** 2 + (oy - ey) ** 2)
-        others.append((dist, i))
-    others.sort()
-
-    slot = 6
-    for _, idx in others[:K_NEAREST]:
-        state[slot] = (hist[idx, t, 0] - ex) / POS_SCALE
-        state[slot + 1] = (hist[idx, t, 1] - ey) / POS_SCALE
-        slot += 2
-    return state
-
-
-def build_action(fut: np.ndarray, hist: np.ndarray, sdc_idx: int, t: int) -> np.ndarray:
-    if t == 0:
-        return np.zeros((2,), dtype=np.float32)
-    dx = (fut[sdc_idx, t, 0] - fut[sdc_idx, t - 1, 0]) / ACT_SCALE
-    dy = (fut[sdc_idx, t, 1] - fut[sdc_idx, t - 1, 1]) / ACT_SCALE
-    cos_h = hist[sdc_idx, -1, 4]
-    sin_h = hist[sdc_idx, -1, 5]
-    xl = dx * cos_h + dy * sin_h
-    yl = -dx * sin_h + dy * cos_h
-    return np.array([xl, yl], dtype=np.float32)
-
-
-def compute_rtg(fut: np.ndarray, sdc_idx: int, horizon: int, rtg_scale: float) -> np.ndarray:
-    rewards = np.zeros((horizon,), dtype=np.float32)
-    for t in range(1, horizon):
-        dx = fut[sdc_idx, t, 0] - fut[sdc_idx, t - 1, 0]
-        dy = fut[sdc_idx, t, 1] - fut[sdc_idx, t - 1, 1]
-        rewards[t] = -math.sqrt(dx**2 + dy**2)
-
-    rtg = np.zeros((horizon,), dtype=np.float32)
-    running = 0.0
-    for t in range(horizon - 1, -1, -1):
-        running += rewards[t]
-        rtg[t] = running / rtg_scale
-    return np.clip(rtg, -1.0, 0.0)
-
-
-class WOMDOfflineRLDataset(Dataset):
-    def __init__(self, tf_dataset: tf.data.Dataset, max_scenarios: int, cfg: TrainConfig):
-        self.context_len = cfg.context_len
-        self.pred_horizon = cfg.pred_horizon
-        self.state_dim = cfg.state_dim
-        self.act_dim = cfg.act_dim
-        self.windows_per_traj = max(1, self.pred_horizon - self.context_len + 1)
-        self.trajectories: list[dict[str, np.ndarray]] = []
-
-        for i, sc in enumerate(tf_dataset):
-            if i >= max_scenarios:
-                break
-            hist = sc["history"][0].numpy()
-            fut = sc["future"][0].numpy()
-            sdc = sc["is_sdc"][0].numpy()
-
-            sdc_idxs = np.where(sdc > 0)[0]
-            if len(sdc_idxs) == 0:
-                continue
-            sdc_idx = int(sdc_idxs[0])
-
-            T = cfg.pred_horizon
-            states = np.array([build_state(hist, sdc_idx) for _ in range(T)], dtype=np.float32)
-            actions = np.array([build_action(fut, hist, sdc_idx, t) for t in range(T)], dtype=np.float32)
-            rtg = compute_rtg(fut, sdc_idx, T, cfg.rtg_scale)
-            self.trajectories.append(
-                {
-                    "states": states,
-                    "actions": actions,
-                    "rtg": rtg,
-                    "timesteps": np.arange(T, dtype=np.int64),
-                }
-            )
-
-        if not self.trajectories:
-            raise RuntimeError("No trajectories extracted. Check shards/auth/config.")
-
-    def __len__(self) -> int:
-        return len(self.trajectories) * self.windows_per_traj
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        traj_idx = idx // self.windows_per_traj
-        start = idx % self.windows_per_traj
-        traj = self.trajectories[traj_idx]
-        T = self.pred_horizon
-        CL = self.context_len
-
-        def window(arr: np.ndarray) -> np.ndarray:
-            end = start + CL
-            if end <= T:
-                return arr[start:end].copy()
-            pad = end - T
-            return np.concatenate([arr[start:T], np.zeros((pad,) + arr.shape[1:], dtype=arr.dtype)], axis=0)
-
-        states = window(traj["states"])
-        actions = window(traj["actions"])
-        rtg = window(traj["rtg"][:, None])
-        timesteps = traj["timesteps"][start : start + CL]
-        if len(timesteps) < CL:
-            timesteps = np.concatenate(
-                [timesteps, np.full((CL - len(timesteps),), timesteps[-1] + 1, dtype=np.int64)]
-            )
-
-        real = min(CL, T - start)
-        mask = np.array([1] * real + [0] * (CL - real), dtype=np.int64)
-
-        return {
-            "states": torch.tensor(states, dtype=torch.float32),
-            "actions": torch.tensor(actions, dtype=torch.float32),
-            "returns_to_go": torch.tensor(rtg, dtype=torch.float32),
-            "timesteps": torch.tensor(timesteps, dtype=torch.long),
-            "attention_mask": torch.tensor(mask, dtype=torch.long),
-        }
 
 
 class DecisionTransformer(nn.Module):
@@ -503,22 +223,29 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    if not validate_gcs_access(cfg):
+    if not validate_gcs_access(cfg.train_path, cfg.val_path):
         raise RuntimeError(
             "GCS authentication failed for gs:// data paths. Set "
             "GOOGLE_APPLICATION_CREDENTIALS or run "
             "`gcloud auth application-default login`."
         )
 
-    train_tf = build_tf_dataset(cfg.train_path, cfg.train_shards, cfg)
-    val_tf = build_tf_dataset(cfg.val_path, cfg.val_shards, cfg)
+    train_tf = build_tf_dataset(cfg.train_path, cfg.train_shards, cfg.n_agents, cfg.n_past, cfg.n_current, cfg.n_future)
+    val_tf = build_tf_dataset(cfg.val_path, cfg.val_shards, cfg.n_agents, cfg.n_past, cfg.n_current, cfg.n_future)
     if train_tf is None:
         raise RuntimeError(f"No train shards found at: {cfg.train_path}")
     if val_tf is None:
         raise RuntimeError(f"No val shards found at: {cfg.val_path}")
 
-    train_ds = WOMDOfflineRLDataset(train_tf, cfg.max_train_scenarios, cfg)
-    val_ds = WOMDOfflineRLDataset(val_tf, cfg.max_val_scenarios, cfg)
+    ds_cfg = DatasetConfig(
+        state_dim=cfg.state_dim,
+        act_dim=cfg.act_dim,
+        context_len=cfg.context_len,
+        pred_horizon=cfg.pred_horizon,
+        rtg_scale=cfg.rtg_scale,
+    )
+    train_ds = WOMDOfflineRLDataset(train_tf, cfg.max_train_scenarios, ds_cfg)
+    val_ds = WOMDOfflineRLDataset(val_tf, cfg.max_val_scenarios, ds_cfg)
     print(f"Train windows: {len(train_ds):,}")
     print(f"Val windows:   {len(val_ds):,}")
 

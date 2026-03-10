@@ -18,9 +18,12 @@ from dt_prediction_export import (
 from dt_trainer import evaluate, train_one_epoch
 from waymo_data_utils import (
     DatasetConfig,
+    TrainingTracker,
     WOMDOfflineRLDataset,
     build_tf_dataset,
+    save_training_plot,
     set_seed,
+    upload_checkpoint,
     validate_gcs_access,
 )
 
@@ -244,11 +247,14 @@ def main() -> None:
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
+    tracker = TrainingTracker(total_epochs=cfg.epochs, train_loader=train_loader)
+    tracker.start_run()
     best_val_mse = float("inf")
     best_model_state: dict[str, torch.Tensor] | None = None
     epoch_history: list[dict[str, dict[str, float] | int]] = []
 
     for epoch in range(1, cfg.epochs + 1):
+        tracker.start_epoch()
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, grad_clip=cfg.grad_clip)
         val_metrics = evaluate(model, val_loader, device)
         improved = val_metrics.action_mse < best_val_mse
@@ -263,7 +269,6 @@ def main() -> None:
                 "val": val_metrics.to_dict(),
             }
         )
-
         print(
             f"Epoch {epoch:03d}/{cfg.epochs} "
             f"train_mse={train_metrics.action_mse:.5f} train_rmse={train_metrics.action_rmse:.5f} "
@@ -272,6 +277,8 @@ def main() -> None:
             f"val_ade={val_metrics.ade_m:.3f} val_fde={val_metrics.fde_m:.3f} "
             f"{'(best)' if improved else ''}"
         )
+        tracker.end_epoch(epoch, train_metrics.action_mse, val_metrics.action_mse)
+    tracker.summary()
 
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
@@ -344,6 +351,13 @@ def main() -> None:
     print(f"Saved checkpoint:       {output_ckpt}")
     print(f"Saved config:           {output_config}")
     print(f"Saved metric report:    {output_metrics}")
+
+    train_losses = [m["train"]["action_mse"] for m in epoch_history]
+    val_losses = [m["val"]["action_mse"] for m in epoch_history]
+    plot_path = str(output_ckpt.parent / "dt_training_curves.png")
+    save_training_plot(train_losses, val_losses, "MSE Loss", plot_path)
+    upload_checkpoint(str(output_ckpt))
+    upload_checkpoint(str(output_config))
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -15,6 +17,15 @@ from google.cloud import storage
 from torch.utils.data import DataLoader, Dataset
 from transformers import GPT2Config, GPT2Model
 
+from tt_metrics import EpochMetrics  # noqa: F401 — re-exported for callers
+from tt_prediction_export import (
+    generate_sample_predictions,
+    save_sample_predictions,
+    summarise_sample_predictions,
+)
+from tt_trainer import evaluate, train_one_epoch
+from waymo_data_utils import TrainingTracker, save_training_plot, upload_checkpoint
+
 
 @dataclass
 class TrainConfig:
@@ -22,10 +33,15 @@ class TrainConfig:
     gcs_bucket: str = "waymo_open_dataset_motion_v_1_2_0"
     train_path: str = "gs://waymo_open_dataset_motion_v_1_2_0/uncompressed/tf_example/training"
     val_path: str = "gs://waymo_open_dataset_motion_v_1_2_0/uncompressed/tf_example/validation"
+    test_path: str = "gs://waymo_open_dataset_motion_v_1_2_0/uncompressed/tf_example/validation"
     train_shards: int = 8
     val_shards: int = 2
+    test_shards: int = 2
     max_train_scenarios: int = 500
     max_val_scenarios: int = 100
+    max_test_scenarios: int = 100
+    max_test_predictions: int = 20
+    beam_size: int = 4
 
     # WOMD v1 schema dimensions.
     n_agents: int = 128
@@ -62,6 +78,8 @@ class TrainConfig:
     num_workers: int = 0
     output_ckpt: str = "outputs/tt_gcs_checkpoint.pt"
     output_config: str = "outputs/tt_gcs_config.json"
+    output_metrics: str = "outputs/tt_gcs_metrics.json"
+    output_test_predictions: str = "outputs/tt_test_predictions.npz"
 
 
 def parse_args() -> TrainConfig:
@@ -651,64 +669,6 @@ class TrajectoryTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Training / evaluation loops
-# ---------------------------------------------------------------------------
-
-def train_one_epoch(
-    model: TrajectoryTransformer,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-) -> float:
-    model.train()
-    total, n = 0.0, 0
-    for batch in loader:
-        ids = batch["input_ids"].to(device)
-        lbls = batch["labels"].to(device)
-        msk = batch["attention_mask"].to(device)
-
-        logits = model(ids, attention_mask=msk)          # (B, L, V)
-        loss = F.cross_entropy(
-            logits.reshape(-1, model.vocab_size),
-            lbls.reshape(-1),
-            ignore_index=-100,
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        total += float(loss.item())
-        n += 1
-    return total / max(n, 1)
-
-
-@torch.no_grad()
-def evaluate(
-    model: TrajectoryTransformer,
-    loader: DataLoader,
-    device: torch.device,
-) -> float:
-    model.eval()
-    total, n = 0.0, 0
-    for batch in loader:
-        ids = batch["input_ids"].to(device)
-        lbls = batch["labels"].to(device)
-        msk = batch["attention_mask"].to(device)
-
-        logits = model(ids, attention_mask=msk)
-        loss = F.cross_entropy(
-            logits.reshape(-1, model.vocab_size),
-            lbls.reshape(-1),
-            ignore_index=-100,
-        )
-        total += float(loss.item())
-        n += 1
-    return total / max(n, 1)
-
-
-# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -792,32 +752,91 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    best_val = float("inf")
+    tracker = TrainingTracker(total_epochs=cfg.epochs, train_loader=train_loader)
+    tracker.start_run()
+    best_val_ce = float("inf")
+    best_model_state: dict[str, torch.Tensor] | None = None
+    epoch_history: list[dict] = []
+
     for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate(model, val_loader, device)
-        best_val = min(best_val, val_loss)
+        tracker.start_epoch()
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
+        val_metrics = evaluate(model, val_loader, device)
+        improved = val_metrics.loss < best_val_ce
+        if improved:
+            best_val_ce = val_metrics.loss
+            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        epoch_history.append({"epoch": epoch, "train": train_metrics.to_dict(), "val": val_metrics.to_dict()})
         print(
             f"Epoch {epoch:03d}/{cfg.epochs} "
-            f"train_ce={train_loss:.5f} val_ce={val_loss:.5f} best_val={best_val:.5f}"
+            f"train_ce={train_metrics.loss:.5f} train_acc={train_metrics.token_acc:.4f} | "
+            f"val_ce={val_metrics.loss:.5f} val_acc={val_metrics.token_acc:.4f} "
+            f"{'(best)' if improved else ''}"
+        )
+        tracker.end_epoch(epoch, train_metrics.loss, val_metrics.loss)
+    tracker.summary()
+
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+
+    # -- Test evaluation (greedy-decoded ADE/FDE on a sample set) ---------------
+    test_tf = build_tf_dataset(cfg.test_path, cfg.test_shards, cfg)
+    if test_tf is None:
+        print("Warning: no test shards found; skipping test evaluation.")
+        test_metrics_dict: dict = {}
+        test_prediction_summary: dict = {"num_samples": 0}
+        test_prediction_samples: list = []
+    else:
+        test_rl = WOMDOfflineRLDataset(test_tf, cfg.max_test_scenarios, cfg)
+        test_tt = TTTokenDataset(test_rl, model)
+        test_loader = DataLoader(
+            test_tt, batch_size=cfg.batch_size, shuffle=False,
+            num_workers=cfg.num_workers, collate_fn=tt_collate,
+        )
+        test_metrics = evaluate(model, test_loader, device)
+        test_metrics_dict = test_metrics.to_dict()
+        print(
+            "Test metrics | "
+            f"ce={test_metrics.loss:.5f} token_acc={test_metrics.token_acc:.4f}"
         )
 
+        test_prediction_samples = generate_sample_predictions(
+            model=model,
+            dataset=test_rl,
+            device=device,
+            max_samples=cfg.max_test_predictions,
+            beam_size=cfg.beam_size,
+        )
+        test_prediction_summary = summarise_sample_predictions(test_prediction_samples)
+        print(
+            "Saved-sample metrics | "
+            f"count={int(test_prediction_summary.get('num_samples', 0))} "
+            f"ade_mean={test_prediction_summary.get('ade_mean_m', float('nan')):.3f}m "
+            f"fde_mean={test_prediction_summary.get('fde_mean_m', float('nan')):.3f}m"
+        )
+
+    # -- Save -------------------------------------------------------------------
     script_dir = Path(__file__).resolve().parent
-    output_ckpt = Path(cfg.output_ckpt)
-    output_config = Path(cfg.output_config)
-    if not output_ckpt.is_absolute():
-        output_ckpt = script_dir / output_ckpt
-    if not output_config.is_absolute():
-        output_config = script_dir / output_config
-    output_ckpt.parent.mkdir(parents=True, exist_ok=True)
-    output_config.parent.mkdir(parents=True, exist_ok=True)
+
+    def _resolve(p: str) -> Path:
+        path = Path(p)
+        return path if path.is_absolute() else script_dir / path
+
+    output_ckpt = _resolve(cfg.output_ckpt)
+    output_config = _resolve(cfg.output_config)
+    output_metrics = _resolve(cfg.output_metrics)
+    output_test_predictions = _resolve(cfg.output_test_predictions)
+
+    for p in (output_ckpt, output_config, output_metrics, output_test_predictions):
+        p.parent.mkdir(parents=True, exist_ok=True)
 
     torch.save(
         {
             "model": model.state_dict(),
             "config": asdict(cfg),
-            "best_val_ce": best_val,
-            # Save bin edges so the checkpoint is self-contained for inference.
+            "best_val_ce": best_val_ce,
+            "test_metrics": test_metrics_dict,
+            "test_sample_metrics": test_prediction_summary,
             "state_bins": model._state_bins,
             "action_bins": model._action_bins,
         },
@@ -825,8 +844,31 @@ def main() -> None:
     )
     with open(output_config, "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, indent=2)
-    print(f"Saved checkpoint: {output_ckpt}")
-    print(f"Saved config:     {output_config}")
+
+    payload = {
+        "best_val_ce": best_val_ce,
+        "test_metrics": test_metrics_dict,
+        "test_sample_metrics": test_prediction_summary,
+        "epochs": epoch_history,
+    }
+    with open(output_metrics, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    if test_prediction_samples:
+        save_sample_predictions(output_test_predictions, test_prediction_samples)
+        print(f"Saved test predictions: {output_test_predictions}")
+
+    print(f"Saved checkpoint:    {output_ckpt}")
+    print(f"Saved config:        {output_config}")
+    print(f"Saved metric report: {output_metrics}")
+
+    train_losses = [m["train"]["loss"] for m in epoch_history]
+    val_losses = [m["val"]["loss"] for m in epoch_history]
+    plot_path = str(output_ckpt.parent / "tt_training_curves.png")
+    save_training_plot(train_losses, val_losses, "CE Loss", plot_path)
+    upload_checkpoint(str(output_ckpt))
+    upload_checkpoint(str(output_config))
+    upload_checkpoint(str(output_metrics))
 
 
 if __name__ == "__main__":

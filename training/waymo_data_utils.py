@@ -9,7 +9,8 @@ from __future__ import annotations  # allows X | Y unions on Python 3.9
 import math
 import os
 import random
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
 import numpy as np
@@ -41,6 +42,73 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+# ---------------------------------------------------------------------------
+# Artifact helpers (visualizations + GCS upload)
+# ---------------------------------------------------------------------------
+
+def upload_to_gcs(local_path: str, gcs_dir: str) -> None:
+    """Upload a local file to a GCS directory (gs://bucket/prefix/).
+
+    Called after saving checkpoints / plots so they land in AIP_MODEL_DIR.
+    """
+    from google.cloud import storage as gcs_storage
+
+    if not gcs_dir.startswith("gs://"):
+        return
+    parts = gcs_dir[5:].split("/", 1)
+    bucket_name = parts[0]
+    prefix = parts[1].rstrip("/") if len(parts) > 1 else ""
+    blob_name = f"{prefix}/{os.path.basename(local_path)}" if prefix else os.path.basename(local_path)
+
+    client = gcs_storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    print(f"Uploaded {local_path} → gs://{bucket_name}/{blob_name}")
+
+
+def save_training_plot(
+    train_losses: list[float],
+    val_losses: list[float],
+    metric_label: str,
+    local_path: str,
+) -> None:
+    """Save a training-curve PNG. Uploads to AIP_MODEL_DIR if set."""
+    import matplotlib
+    matplotlib.use("Agg")          # non-interactive backend safe for headless training
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    epochs = range(1, len(train_losses) + 1)
+    ax.plot(epochs, train_losses, label=f"Train {metric_label}", color="#1f77b4")
+    ax.plot(epochs, val_losses,   label=f"Val {metric_label}",   color="#ff7f0e")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(metric_label)
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(local_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved training curves → {local_path}")
+
+    aip_model_dir = os.environ.get("AIP_MODEL_DIR", "")
+    if aip_model_dir:
+        try:
+            upload_to_gcs(local_path, aip_model_dir)
+        except Exception as exc:
+            print(f"Warning: could not upload plot to GCS: {exc}")
+
+
+def upload_checkpoint(local_path: str) -> None:
+    """Upload a checkpoint file to AIP_MODEL_DIR if the env var is set."""
+    aip_model_dir = os.environ.get("AIP_MODEL_DIR", "")
+    if aip_model_dir:
+        try:
+            upload_to_gcs(local_path, aip_model_dir)
+        except Exception as exc:
+            print(f"Warning: could not upload checkpoint to GCS: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -507,3 +575,111 @@ def tt_collate(batch: list[dict]) -> dict[str, torch.Tensor]:
         "labels": torch.stack(labels_list),
         "attention_mask": torch.stack(mask_list),
     }
+
+
+# ---------------------------------------------------------------------------
+# Training tracker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EpochStats:
+    epoch: int
+    train_loss: float
+    val_loss: float
+    epoch_secs: float
+    samples_trained: int
+    peak_gpu_mb: float
+
+
+@dataclass
+class TrainingTracker:
+    """
+    Tracks wall time and GPU memory across training epochs.
+
+    Usage::
+
+        tracker = TrainingTracker(total_epochs=cfg.epochs, train_loader=train_loader)
+        for epoch in range(1, cfg.epochs + 1):
+            tracker.start_epoch()
+            train_loss = train_one_epoch(...)
+            val_loss   = evaluate(...)
+            tracker.end_epoch(epoch, train_loss, val_loss)
+        tracker.summary()
+    """
+
+    total_epochs: int
+    train_loader: object          # DataLoader — used to count samples per epoch
+    _run_start: float = field(default=0.0, init=False, repr=False)
+    _epoch_start: float = field(default=0.0, init=False, repr=False)
+    history: list[EpochStats] = field(default_factory=list, init=False)
+
+    def start_run(self) -> None:
+        """Call once before the epoch loop."""
+        self._reset_gpu_stats()
+        self._run_start = time.perf_counter()
+
+    def start_epoch(self) -> None:
+        self._reset_gpu_stats()
+        self._epoch_start = time.perf_counter()
+
+    def end_epoch(self, epoch: int, train_loss: float, val_loss: float) -> None:
+        epoch_secs = time.perf_counter() - self._epoch_start
+        elapsed    = time.perf_counter() - self._run_start
+        peak_mb    = self._peak_gpu_mb()
+
+        try:
+            batch_size = self.train_loader.batch_size or 1
+            n_batches  = len(self.train_loader)
+            samples    = batch_size * n_batches
+        except Exception:
+            samples = 0
+
+        stat = EpochStats(
+            epoch=epoch,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            epoch_secs=epoch_secs,
+            samples_trained=samples,
+            peak_gpu_mb=peak_mb,
+        )
+        self.history.append(stat)
+
+        throughput = samples / epoch_secs if epoch_secs > 0 else 0.0
+        gpu_info   = f"  peak_gpu={peak_mb:.0f}MB" if peak_mb > 0 else ""
+        print(
+            f"  elapsed={elapsed:.1f}s  epoch={epoch_secs:.1f}s"
+            f"  throughput={throughput:.0f} samples/s{gpu_info}"
+        )
+
+    def summary(self) -> None:
+        if not self.history:
+            return
+        total_secs  = sum(s.epoch_secs for s in self.history)
+        best        = min(self.history, key=lambda s: s.val_loss)
+        peak_mb     = max(s.peak_gpu_mb for s in self.history)
+        avg_ep      = total_secs / len(self.history)
+        total_samps = sum(s.samples_trained for s in self.history)
+
+        print("\n── Training Summary " + "─" * 41)
+        print(f"  Total wall time : {total_secs:.1f}s  ({total_secs/60:.1f} min)")
+        print(f"  Avg time/epoch  : {avg_ep:.1f}s")
+        print(f"  Total samples   : {total_samps:,}")
+        if peak_mb > 0:
+            print(f"  Peak GPU memory : {peak_mb:.0f} MB")
+        print(
+            f"  Best val loss   : {best.val_loss:.5f}  (epoch {best.epoch})"
+        )
+        print("─" * 60)
+
+    # -- helpers --------------------------------------------------------------
+
+    @staticmethod
+    def _reset_gpu_stats() -> None:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    @staticmethod
+    def _peak_gpu_mb() -> float:
+        if torch.cuda.is_available():
+            return torch.cuda.max_memory_allocated() / 1024 ** 2
+        return 0.0

@@ -70,13 +70,14 @@ def check_gcs_access(bucket: str) -> bool:
         return False
 
 
-def validate_gcs_access(train_path: str, val_path: str) -> bool:
+def validate_gcs_access(train_path: str, val_path: str, test_path: str | None = None) -> bool:
     buckets = sorted(
         {
             b
             for b in (
                 gcs_bucket_from_path(train_path),
                 gcs_bucket_from_path(val_path),
+                gcs_bucket_from_path(test_path) if test_path else None,
             )
             if b is not None
         }
@@ -93,6 +94,8 @@ def validate_gcs_access(train_path: str, val_path: str) -> bool:
 def build_features(n_agents: int, n_past: int, n_current: int, n_future: int) -> dict:
     import tensorflow as tf
     state_features: dict = {}
+    # Scenario id can be used later to guarantee prediction-map alignment.
+    state_features["scenario/id"] = tf.io.FixedLenFeature([], tf.string, default_value=b"")
     for split, steps in [("past", n_past), ("current", n_current), ("future", n_future)]:
         for feat in ["x", "y", "bbox_yaw", "velocity_x", "velocity_y", "valid"]:
             dtype = tf.int64 if feat == "valid" else tf.float32
@@ -154,6 +157,8 @@ def parse_scenario(raw: bytes, features: dict) -> dict:
         "history": tf.concat([past, cur], axis=1),
         "future": future,
         "fut_valid": fut_valid,
+        "future_valid": ex["state/future/valid"],
+        "scenario_id": ex["scenario/id"],
         "is_sdc": ex["state/is_sdc"],
         "type": ex["state/type"],
     }
@@ -306,6 +311,19 @@ class WOMDOfflineRLDataset(Dataset):
             hist = sc["history"][0].numpy()
             fut = sc["future"][0].numpy()
             sdc = sc["is_sdc"][0].numpy()
+            future_valid_all = sc.get("future_valid")
+            scenario_id = ""
+            if "scenario_id" in sc:
+                scenario_id_raw = sc["scenario_id"][0].numpy()
+                if isinstance(scenario_id_raw, np.ndarray):
+                    if scenario_id_raw.shape == ():
+                        scenario_id_raw = scenario_id_raw.item()
+                    elif scenario_id_raw.size > 0:
+                        scenario_id_raw = scenario_id_raw.reshape(-1)[0]
+                if isinstance(scenario_id_raw, bytes):
+                    scenario_id = scenario_id_raw.decode("utf-8", errors="ignore")
+                else:
+                    scenario_id = str(scenario_id_raw)
 
             sdc_idxs = np.where(sdc > 0)[0]
             if len(sdc_idxs) == 0:
@@ -320,12 +338,28 @@ class WOMDOfflineRLDataset(Dataset):
                 [build_action(fut, hist, sdc_idx, t) for t in range(T)], dtype=np.float32
             )
             rtg = compute_rtg(fut, sdc_idx, T, cfg.rtg_scale)
+            future_xy = fut[sdc_idx, :T, :2].astype(np.float32)
+            heading_cos = float(hist[sdc_idx, -1, 4])
+            heading_sin = float(hist[sdc_idx, -1, 5])
+            anchor_xy = hist[sdc_idx, -1, :2].astype(np.float32)
+            if future_valid_all is not None:
+                future_valid_np = future_valid_all[0].numpy()[sdc_idx, :T].astype(np.int64)
+            else:
+                future_valid_np = np.ones((T,), dtype=np.int64)
+
             self.trajectories.append(
                 {
                     "states": states,
                     "actions": actions,
                     "rtg": rtg,
                     "timesteps": np.arange(T, dtype=np.int64),
+                    "future_xy": future_xy,
+                    "future_valid": future_valid_np,
+                    "heading_cos": heading_cos,
+                    "heading_sin": heading_sin,
+                    "anchor_xy": anchor_xy,
+                    "scenario_index": i,
+                    "scenario_id": scenario_id,
                 }
             )
 
@@ -336,7 +370,7 @@ class WOMDOfflineRLDataset(Dataset):
         """Synthetic circular trajectories for smoke-testing without real data."""
         print(f"No tf_dataset provided — generating {n} synthetic trajectories.")
         T = self.pred_horizon
-        for _ in range(n):
+        for traj_idx in range(n):
             radius = np.random.uniform(5, 30)
             omega = np.random.uniform(0.05, 0.2)
             phase = np.random.uniform(0, 2 * math.pi)
@@ -363,6 +397,13 @@ class WOMDOfflineRLDataset(Dataset):
                     "actions": actions,
                     "rtg": rtg,
                     "timesteps": np.arange(T, dtype=np.int64),
+                    "future_xy": states[:, :2] * POS_SCALE,
+                    "future_valid": np.ones((T,), dtype=np.int64),
+                    "heading_cos": 1.0,
+                    "heading_sin": 0.0,
+                    "anchor_xy": np.array([states[0, 0], states[0, 1]], dtype=np.float32) * POS_SCALE,
+                    "scenario_index": -1,
+                    "scenario_id": f"synthetic_{traj_idx:06d}",
                 }
             )
 

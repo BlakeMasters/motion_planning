@@ -9,7 +9,7 @@
   "max_train_scenarios": 20,
   "max_val_scenarios": 10,
   "max_test_scenarios": 10,
-  "max_train_samples": 200,
+  "max_train_samples": 500,
   "max_val_samples": 100,
   "max_test_samples": 100,
   "max_test_predictions": 5,

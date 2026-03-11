@@ -78,7 +78,7 @@ def draw_track(ax: plt.Axes, track: Any) -> None:
     )
 
 
-def draw_prediction_overlay(ax: plt.Axes, overlay: PredictionOverlay) -> None:
+def draw_prediction_overlay(ax: plt.Axes, overlay: PredictionOverlay, model_label: str = "Decision Transformer") -> None:
     valid = overlay.valid_mask.astype(bool)
     if valid.sum() == 0:
         return
@@ -102,7 +102,7 @@ def draw_prediction_overlay(ax: plt.Axes, overlay: PredictionOverlay) -> None:
         linestyle="-",
         linewidth=2.0,
         color="crimson",
-        label="Decision Transformer",
+        label=model_label,
         zorder=21,
     )
     ax.scatter(
@@ -298,6 +298,7 @@ def visualize_scenario(
     max_tracks: int | None = None,
     overlay: PredictionOverlay | None = None,
     zoom_meters: float = 120.0,
+    model_label: str = "Decision Transformer",
 ) -> None:
     try:
         from waymo_open_dataset.utils.sim_agents import visualizations
@@ -315,7 +316,7 @@ def visualize_scenario(
         draw_track(ax, track)
 
     if overlay is not None:
-        draw_prediction_overlay(ax, overlay)
+        draw_prediction_overlay(ax, overlay, model_label=model_label)
 
     ax.set_aspect("equal", adjustable="box")
     title = (
@@ -324,7 +325,7 @@ def visualize_scenario(
         f"map_features={len(scenario.map_features)}"
     )
     if overlay is not None and overlay.ade_m is not None and overlay.fde_m is not None:
-        title += f"\nDT ADE={overlay.ade_m:.2f}m  FDE={overlay.fde_m:.2f}m"
+        title += f"\n{model_label} ADE={overlay.ade_m:.2f}m  FDE={overlay.fde_m:.2f}m"
     ax.set_title(title)
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
@@ -401,6 +402,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Display the figure in a GUI window in addition to saving.",
     )
+    parser.add_argument(
+        "--model-label",
+        type=str,
+        default="Decision Transformer",
+        help="Model name shown in the legend and title (e.g. 'Trajectory Transformer').",
+    )
     return parser.parse_args()
 
 
@@ -468,6 +475,7 @@ def main() -> None:
         args.max_tracks,
         overlay=overlay,
         zoom_meters=args.zoom_meters,
+        model_label=args.model_label,
     )
     print(f"Saved visualization to: {args.output}")
     print(f"Scenario index: {resolved_index}")

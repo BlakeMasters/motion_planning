@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -53,11 +53,16 @@ class TrainConfig:
     n_future: int = 80
 
     # RL sequence setup.
-    state_dim: int = 16
+    use_map_features: bool = False
     act_dim: int = 2
     context_len: int = 20
-    pred_horizon: int = 16
+    pred_horizon: int = 50
     rtg_scale: float = 10.0
+    state_dim: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        from waymo_data_utils import STATE_DIM_MAP, STATE_DIM_BASE
+        self.state_dim = STATE_DIM_MAP if self.use_map_features else STATE_DIM_BASE
 
     # Model.
     hidden_size: int = 128
@@ -115,9 +120,10 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--output-config", type=str, default=TrainConfig.output_config)
     parser.add_argument("--output-metrics", type=str, default=TrainConfig.output_metrics)
     parser.add_argument("--output-test-predictions", type=str, default=TrainConfig.output_test_predictions)
+    parser.add_argument("--use-map-features", action="store_true", default=False)
     args = parser.parse_args()
 
-    cfg = TrainConfig()
+    cfg = TrainConfig(use_map_features=args.use_map_features)
     cfg.gcs_bucket = args.gcs_bucket
     cfg.train_path = args.train_path
     cfg.val_path = args.val_path
@@ -171,15 +177,19 @@ def _build_rl_dataset(
     max_scenarios: int,
     cfg: TrainConfig,
 ) -> WOMDOfflineRLDataset:
-    tf_ds = build_tf_dataset(path, shards, cfg.n_agents, cfg.n_past, cfg.n_current, cfg.n_future)
+    tf_ds = build_tf_dataset(
+        path, shards,
+        cfg.n_agents, cfg.n_past, cfg.n_current, cfg.n_future,
+        use_map_features=cfg.use_map_features,
+    )
     if tf_ds is None:
         raise RuntimeError(f"No shards found at: {path}")
     ds_cfg = DatasetConfig(
-        state_dim=cfg.state_dim,
         act_dim=cfg.act_dim,
         context_len=cfg.context_len,
         pred_horizon=cfg.pred_horizon,
         rtg_scale=cfg.rtg_scale,
+        use_map_features=cfg.use_map_features,
     )
     return WOMDOfflineRLDataset(tf_ds, max_scenarios, ds_cfg)
 
@@ -240,7 +250,7 @@ def main() -> None:
         act_dim=cfg.act_dim,
         hidden_size=cfg.hidden_size,
         max_length=cfg.context_len,
-        max_ep_len=max(cfg.pred_horizon + cfg.context_len + 2, cfg.pred_horizon + 10),
+        max_ep_len=cfg.pred_horizon + 10,
         n_layer=cfg.n_layer,
         n_head=cfg.n_head,
         dropout=cfg.dropout,

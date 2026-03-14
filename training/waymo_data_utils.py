@@ -33,6 +33,13 @@ VEL_SCALE = 15.0
 ACT_SCALE = 1.5
 K_NEAREST = 5
 
+# Map / traffic-light features
+K_ROAD = 8              # nearest valid lane-centre roadgraph points to include
+K_TL   = 2              # nearest valid traffic lights to include
+LANE_TYPES = frozenset([1, 2, 3])   # freeway / surface street / bike lane centres
+STATE_DIM_BASE = 16
+STATE_DIM_MAP  = STATE_DIM_BASE + K_ROAD * 4 + K_TL * 3   # 16 + 32 + 6 = 54
+
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -159,10 +166,15 @@ def validate_gcs_access(train_path: str, val_path: str, test_path: str | None = 
 # TFRecord / dataset construction
 # ---------------------------------------------------------------------------
 
-def build_features(n_agents: int, n_past: int, n_current: int, n_future: int) -> dict:
+def build_features(
+    n_agents: int,
+    n_past: int,
+    n_current: int,
+    n_future: int,
+    use_map_features: bool = False,
+) -> dict:
     import tensorflow as tf
     state_features: dict = {}
-    # Scenario id can be used later to guarantee prediction-map alignment.
     state_features["scenario/id"] = tf.io.FixedLenFeature([], tf.string, default_value=b"")
     for split, steps in [("past", n_past), ("current", n_current), ("future", n_future)]:
         for feat in ["x", "y", "bbox_yaw", "velocity_x", "velocity_y", "valid"]:
@@ -173,6 +185,16 @@ def build_features(n_agents: int, n_past: int, n_current: int, n_future: int) ->
     for key in ("is_sdc", "type"):
         dtype = tf.int64 if key == "is_sdc" else tf.float32
         state_features[f"state/{key}"] = tf.io.FixedLenFeature([n_agents], dtype)
+    if use_map_features:
+        N_RG, N_TL = 30000, 16
+        state_features["roadgraph_samples/xyz"]   = tf.io.FixedLenFeature([N_RG * 3], tf.float32)
+        state_features["roadgraph_samples/dir"]   = tf.io.FixedLenFeature([N_RG * 3], tf.float32)
+        state_features["roadgraph_samples/type"]  = tf.io.FixedLenFeature([N_RG],     tf.int64)
+        state_features["roadgraph_samples/valid"] = tf.io.FixedLenFeature([N_RG],     tf.int64)
+        state_features["traffic_light_state/current/x"]     = tf.io.FixedLenFeature([N_TL], tf.float32)
+        state_features["traffic_light_state/current/y"]     = tf.io.FixedLenFeature([N_TL], tf.float32)
+        state_features["traffic_light_state/current/state"] = tf.io.FixedLenFeature([N_TL], tf.int64)
+        state_features["traffic_light_state/current/valid"] = tf.io.FixedLenFeature([N_TL], tf.int64)
     return state_features
 
 
@@ -197,7 +219,7 @@ def list_shards(path: str, n: int) -> list[str]:
     return paths[:n]
 
 
-def parse_scenario(raw: bytes, features: dict) -> dict:
+def parse_scenario(raw: bytes, features: dict, use_map_features: bool = False) -> dict:
     import tensorflow as tf
     ex = tf.io.parse_single_example(raw, features)
 
@@ -221,7 +243,7 @@ def parse_scenario(raw: bytes, features: dict) -> dict:
         [ex["state/past/valid"], ex["state/current/valid"], ex["state/future/valid"]],
         axis=1,
     )
-    return {
+    out = {
         "history": tf.concat([past, cur], axis=1),
         "future": future,
         "fut_valid": fut_valid,
@@ -230,6 +252,16 @@ def parse_scenario(raw: bytes, features: dict) -> dict:
         "is_sdc": ex["state/is_sdc"],
         "type": ex["state/type"],
     }
+    if use_map_features:
+        out["rg_xyz"]    = ex["roadgraph_samples/xyz"]    # flat [90000]
+        out["rg_dir"]    = ex["roadgraph_samples/dir"]    # flat [90000]
+        out["rg_type"]   = ex["roadgraph_samples/type"]   # [30000]
+        out["rg_valid"]  = ex["roadgraph_samples/valid"]  # [30000]
+        out["tl_x"]      = ex["traffic_light_state/current/x"]     # [16]
+        out["tl_y"]      = ex["traffic_light_state/current/y"]     # [16]
+        out["tl_state"]  = ex["traffic_light_state/current/state"] # [16]
+        out["tl_valid"]  = ex["traffic_light_state/current/valid"] # [16]
+    return out
 
 
 def build_tf_dataset(
@@ -239,6 +271,7 @@ def build_tf_dataset(
     n_past: int,
     n_current: int,
     n_future: int,
+    use_map_features: bool = False,
 ) -> Optional[object]:
     import tensorflow as tf
     shards = list_shards(path, n_shards)
@@ -246,10 +279,13 @@ def build_tf_dataset(
         return None
     print(f"Using {len(shards)} shards from {path}")
     print(f"First shard: {shards[0]}")
-    features = build_features(n_agents, n_past, n_current, n_future)
+    features = build_features(n_agents, n_past, n_current, n_future, use_map_features)
     ds = (
         tf.data.TFRecordDataset(shards, num_parallel_reads=4)
-        .map(lambda raw: parse_scenario(raw, features), num_parallel_calls=tf.data.AUTOTUNE)
+        .map(
+            lambda raw: parse_scenario(raw, features, use_map_features),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
         .batch(1)
         .prefetch(tf.data.AUTOTUNE)
     )
@@ -263,9 +299,20 @@ def build_tf_dataset(
 def build_state(hist: np.ndarray, sdc_idx: int) -> np.ndarray:
     """Build a 16-dim ego-centric state vector from the last history frame."""
     t = hist.shape[1] - 1
-    ex, ey, evx, evy, cosh, sinh = hist[sdc_idx, t]
+    return build_state_at_frame(hist[:, t, :], sdc_idx)
 
-    state = np.zeros((16,), dtype=np.float32)
+
+def build_state_at_frame(frame: np.ndarray, sdc_idx: int) -> np.ndarray:
+    """Build a 16-dim ego-centric state vector from a single agent frame.
+
+    Args:
+        frame: (n_agents, 6) array with columns (x, y, vx, vy, cos_h, sin_h)
+               for one timestep.
+        sdc_idx: index of the self-driving car in the agent dimension.
+    """
+    ex, ey, evx, evy, cosh, sinh = frame[sdc_idx]
+
+    state = np.zeros((STATE_DIM_BASE,), dtype=np.float32)
     state[0] = ex / POS_SCALE
     state[1] = ey / POS_SCALE
     state[2] = cosh
@@ -274,10 +321,10 @@ def build_state(hist: np.ndarray, sdc_idx: int) -> np.ndarray:
     state[5] = evy / VEL_SCALE
 
     others = []
-    for i in range(hist.shape[0]):
+    for i in range(frame.shape[0]):
         if i == sdc_idx:
             continue
-        ox, oy = hist[i, t, 0], hist[i, t, 1]
+        ox, oy = frame[i, 0], frame[i, 1]
         if ox == 0 and oy == 0:
             continue
         dist = math.sqrt((ox - ex) ** 2 + (oy - ey) ** 2)
@@ -286,9 +333,72 @@ def build_state(hist: np.ndarray, sdc_idx: int) -> np.ndarray:
 
     slot = 6
     for _, idx in others[:K_NEAREST]:
-        state[slot] = (hist[idx, t, 0] - ex) / POS_SCALE
-        state[slot + 1] = (hist[idx, t, 1] - ey) / POS_SCALE
+        state[slot] = (frame[idx, 0] - ex) / POS_SCALE
+        state[slot + 1] = (frame[idx, 1] - ey) / POS_SCALE
         slot += 2
+    return state
+
+
+def build_map_state(
+    base_state: np.ndarray,
+    ego_x: float,
+    ego_y: float,
+    cos_h: float,
+    sin_h: float,
+    rg_xyz: np.ndarray,
+    rg_dir: np.ndarray,
+    rg_type: np.ndarray,
+    rg_valid: np.ndarray,
+    tl_x: np.ndarray,
+    tl_y: np.ndarray,
+    tl_state: np.ndarray,
+    tl_valid: np.ndarray,
+) -> np.ndarray:
+    """Extend a 16-dim base state with K_ROAD lane-centre points and K_TL traffic lights.
+
+    Returns a STATE_DIM_MAP (54) dimensional vector. Positions are expressed in
+    the ego frame and normalised by POS_SCALE; direction vectors are unit-length
+    and rotated to ego frame; traffic-light state is normalised to [0, 1].
+    """
+    state = np.zeros(STATE_DIM_MAP, dtype=np.float32)
+    state[:STATE_DIM_BASE] = base_state
+
+    # --- nearest lane-centre roadgraph points ---
+    lane_mask = (rg_valid == 1) & np.isin(rg_type, list(LANE_TYPES))
+    if lane_mask.any():
+        lane_xy  = rg_xyz[lane_mask, :2]   # (M, 2)
+        lane_dir = rg_dir[lane_mask, :2]   # (M, 2) unit vectors
+        dists = np.hypot(lane_xy[:, 0] - ego_x, lane_xy[:, 1] - ego_y)
+        k = min(K_ROAD, len(dists))
+        top_k = np.argpartition(dists, k - 1)[:k]
+        top_k = top_k[np.argsort(dists[top_k])]
+        slot = STATE_DIM_BASE
+        for ni in top_k:
+            dx = (lane_xy[ni, 0] - ego_x) / POS_SCALE
+            dy = (lane_xy[ni, 1] - ego_y) / POS_SCALE
+            state[slot]     =  dx * cos_h + dy * sin_h   # ego-frame x
+            state[slot + 1] = -dx * sin_h + dy * cos_h   # ego-frame y
+            state[slot + 2] =  lane_dir[ni, 0] * cos_h + lane_dir[ni, 1] * sin_h
+            state[slot + 3] = -lane_dir[ni, 0] * sin_h + lane_dir[ni, 1] * cos_h
+            slot += 4
+
+    # --- nearest valid traffic lights ---
+    tl_mask = (tl_valid == 1)
+    if tl_mask.any():
+        vtl_x, vtl_y, vtl_s = tl_x[tl_mask], tl_y[tl_mask], tl_state[tl_mask]
+        dists = np.hypot(vtl_x - ego_x, vtl_y - ego_y)
+        k = min(K_TL, len(dists))
+        top_k = np.argpartition(dists, k - 1)[:k]
+        top_k = top_k[np.argsort(dists[top_k])]
+        slot = STATE_DIM_BASE + K_ROAD * 4
+        for ni in top_k:
+            dx = (vtl_x[ni] - ego_x) / POS_SCALE
+            dy = (vtl_y[ni] - ego_y) / POS_SCALE
+            state[slot]     =  dx * cos_h + dy * sin_h
+            state[slot + 1] = -dx * sin_h + dy * cos_h
+            state[slot + 2] = float(vtl_s[ni]) / 8.0   # normalise 0-8 → [0, 1]
+            slot += 3
+
     return state
 
 
@@ -330,11 +440,15 @@ def compute_rtg(
 @dataclass
 class DatasetConfig:
     """Subset of TrainConfig fields consumed by WOMDOfflineRLDataset."""
-    state_dim: int
     act_dim: int
     context_len: int
     pred_horizon: int
     rtg_scale: float
+    use_map_features: bool = False
+    state_dim: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.state_dim = STATE_DIM_MAP if self.use_map_features else STATE_DIM_BASE
 
 
 class WOMDOfflineRLDataset(Dataset):
@@ -399,9 +513,36 @@ class WOMDOfflineRLDataset(Dataset):
             sdc_idx = int(sdc_idxs[0])
 
             T = cfg.pred_horizon
-            states = np.array(
-                [build_state(hist, sdc_idx) for _ in range(T)], dtype=np.float32
-            )
+
+            if cfg.use_map_features:
+                rg_xyz   = sc["rg_xyz"][0].numpy().reshape(30000, 3).astype(np.float32)
+                rg_dir   = sc["rg_dir"][0].numpy().reshape(30000, 3).astype(np.float32)
+                rg_type  = sc["rg_type"][0].numpy()
+                rg_valid = sc["rg_valid"][0].numpy()
+                tl_x     = sc["tl_x"][0].numpy().astype(np.float32)
+                tl_y     = sc["tl_y"][0].numpy().astype(np.float32)
+                tl_state = sc["tl_state"][0].numpy()
+                tl_valid = sc["tl_valid"][0].numpy()
+                # Per-timestep state: base state updates from future frames;
+                # roadgraph/TL features use t=0 ego frame (roadgraph is static,
+                # TL current-state is the only one available in WOMD).
+                states = np.array([
+                    build_map_state(
+                        build_state_at_frame(fut[:, t, :], sdc_idx),
+                        float(fut[sdc_idx, t, 0]),
+                        float(fut[sdc_idx, t, 1]),
+                        float(fut[sdc_idx, t, 4]),
+                        float(fut[sdc_idx, t, 5]),
+                        rg_xyz, rg_dir, rg_type, rg_valid,
+                        tl_x, tl_y, tl_state, tl_valid,
+                    ) for t in range(T)
+                ], dtype=np.float32)
+            else:
+                # Per-timestep state from future frames.
+                states = np.array(
+                    [build_state_at_frame(fut[:, t, :], sdc_idx) for t in range(T)],
+                    dtype=np.float32,
+                )
             actions = np.array(
                 [build_action(fut, hist, sdc_idx, t) for t in range(T)], dtype=np.float32
             )
@@ -589,6 +730,8 @@ class EpochStats:
     epoch_secs: float
     samples_trained: int
     peak_gpu_mb: float
+    cpu_percent: float = 0.0   # process CPU % averaged over the epoch
+    ram_mb: float = 0.0        # process RSS at epoch end (MB)
 
 
 @dataclass
@@ -611,21 +754,38 @@ class TrainingTracker:
     train_loader: object          # DataLoader — used to count samples per epoch
     _run_start: float = field(default=0.0, init=False, repr=False)
     _epoch_start: float = field(default=0.0, init=False, repr=False)
+    _proc: object = field(default=None, init=False, repr=False)  # psutil.Process
     history: list[EpochStats] = field(default_factory=list, init=False)
 
     def start_run(self) -> None:
         """Call once before the epoch loop."""
+        try:
+            import psutil
+            self._proc = psutil.Process()
+            self._proc.cpu_percent(interval=None)  # prime the counter
+        except ImportError:
+            self._proc = None
         self._reset_gpu_stats()
         self._run_start = time.perf_counter()
 
     def start_epoch(self) -> None:
         self._reset_gpu_stats()
+        if self._proc is not None:
+            self._proc.cpu_percent(interval=None)  # reset interval for this epoch
         self._epoch_start = time.perf_counter()
 
     def end_epoch(self, epoch: int, train_loss: float, val_loss: float) -> None:
         epoch_secs = time.perf_counter() - self._epoch_start
         elapsed    = time.perf_counter() - self._run_start
         peak_mb    = self._peak_gpu_mb()
+
+        cpu_pct, ram_mb = 0.0, 0.0
+        if self._proc is not None:
+            try:
+                cpu_pct = self._proc.cpu_percent(interval=None)
+                ram_mb  = self._proc.memory_info().rss / 1024 ** 2
+            except Exception:
+                pass
 
         try:
             batch_size = self.train_loader.batch_size or 1
@@ -641,14 +801,17 @@ class TrainingTracker:
             epoch_secs=epoch_secs,
             samples_trained=samples,
             peak_gpu_mb=peak_mb,
+            cpu_percent=cpu_pct,
+            ram_mb=ram_mb,
         )
         self.history.append(stat)
 
         throughput = samples / epoch_secs if epoch_secs > 0 else 0.0
         gpu_info   = f"  peak_gpu={peak_mb:.0f}MB" if peak_mb > 0 else ""
+        cpu_info   = f"  cpu={cpu_pct:.0f}%  ram={ram_mb:.0f}MB" if self._proc is not None else ""
         print(
             f"  elapsed={elapsed:.1f}s  epoch={epoch_secs:.1f}s"
-            f"  throughput={throughput:.0f} samples/s{gpu_info}"
+            f"  throughput={throughput:.0f} samples/s{gpu_info}{cpu_info}"
         )
 
     def summary(self) -> None:

@@ -32,7 +32,7 @@ class DecisionTransformer(nn.Module):
             n_head=n_head,
             n_inner=4 * hidden_size,
             activation_function="relu",
-            n_positions=3 * max_length + 2,
+            n_positions=3 * max(max_length, max_ep_len) + 2,
             resid_pdrop=dropout,
             attn_pdrop=dropout,
         )

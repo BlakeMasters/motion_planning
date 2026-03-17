@@ -12,6 +12,7 @@ Comparative study of Decision Transformer (DT) and Trajectory Transformer (TT) f
 - `training/eval_constant_velocity.py` — constant-velocity baseline evaluation
 - `training/waymo_data_utils.py` — shared data pipeline (TFRecord decoding, MDP construction, dataset classes)
 - `training/outputs/` — local training artifacts (checkpoints, configs)
+- 'notebooks/colab_training.ipynb' – setup to train using T4 GPUs in Colab
 
 ## Results summary
 
@@ -44,5 +45,17 @@ python training/train_trajectory_transformer_gcs.py --max-train-scenarios 500
 Convert a local TFRecord shard to torch/npz samples:
 
 ```bash
-python training/eval_constant_velocity.py
+python scripts/convert_waymo_to_torch.py --help
+```
+
+Visualize one scenario:
+
+```bash
+python scripts/visualize_waymo_sample.py --help
+```
+
+Overlay Decision Transformer predictions vs true trajectory on map:
+
+```bash
+python scripts/visualize_waymo_sample.py --tfrecord uncompressed_scenario_training_20s_training_20s.tfrecord-00000-of-01000 --predictions training/outputs/dt_test_predictions.npz --prediction-index 0 --output dt_overlay.png
 ```

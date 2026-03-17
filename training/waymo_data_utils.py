@@ -280,15 +280,30 @@ def build_tf_dataset(
     print(f"Using {len(shards)} shards from {path}")
     print(f"First shard: {shards[0]}")
     features = build_features(n_agents, n_past, n_current, n_future, use_map_features)
-    ds = (
-        tf.data.TFRecordDataset(shards, num_parallel_reads=4)
-        .map(
-            lambda raw: parse_scenario(raw, features, use_map_features),
-            num_parallel_calls=tf.data.AUTOTUNE,
+    # When map features are enabled each parsed scenario carries ~1.2 MB of
+    # raw roadgraph tensors.  Parallel reads + AUTOTUNE prefetch can buffer
+    # hundreds of these, causing multi-GB RSS before training starts.
+    # Force sequential, single-element buffering to keep memory bounded.
+    if use_map_features:
+        ds = (
+            tf.data.TFRecordDataset(shards, num_parallel_reads=1)
+            .map(
+                lambda raw: parse_scenario(raw, features, use_map_features),
+                num_parallel_calls=1,
+            )
+            .batch(1)
+            .prefetch(1)
         )
-        .batch(1)
-        .prefetch(tf.data.AUTOTUNE)
-    )
+    else:
+        ds = (
+            tf.data.TFRecordDataset(shards, num_parallel_reads=4)
+            .map(
+                lambda raw: parse_scenario(raw, features, use_map_features),
+                num_parallel_calls=tf.data.AUTOTUNE,
+            )
+            .batch(1)
+            .prefetch(tf.data.AUTOTUNE)
+        )
     return ds
 
 
@@ -353,50 +368,62 @@ def build_map_state(
     tl_y: np.ndarray,
     tl_state: np.ndarray,
     tl_valid: np.ndarray,
+    _lane_xy: np.ndarray = None,
+    _lane_dir: np.ndarray = None,
+    _vtl_x: np.ndarray = None,
+    _vtl_y: np.ndarray = None,
+    _vtl_s: np.ndarray = None,
 ) -> np.ndarray:
     """Extend a 16-dim base state with K_ROAD lane-centre points and K_TL traffic lights.
 
     Returns a STATE_DIM_MAP (54) dimensional vector. Positions are expressed in
     the ego frame and normalised by POS_SCALE; direction vectors are unit-length
     and rotated to ego frame; traffic-light state is normalised to [0, 1].
+
+    _lane_xy, _lane_dir, _vtl_* are pre-filtered arrays (computed once per scenario)
+    to avoid re-scanning 30k roadgraph points at every timestep.
     """
     state = np.zeros(STATE_DIM_MAP, dtype=np.float32)
     state[:STATE_DIM_BASE] = base_state
 
     # --- nearest lane-centre roadgraph points ---
-    lane_mask = (rg_valid == 1) & np.isin(rg_type, list(LANE_TYPES))
-    if lane_mask.any():
-        lane_xy  = rg_xyz[lane_mask, :2]   # (M, 2)
-        lane_dir = rg_dir[lane_mask, :2]   # (M, 2) unit vectors
-        dists = np.hypot(lane_xy[:, 0] - ego_x, lane_xy[:, 1] - ego_y)
+    if _lane_xy is None:
+        lane_mask = (rg_valid == 1) & np.isin(rg_type, list(LANE_TYPES))
+        _lane_xy  = rg_xyz[lane_mask, :2]
+        _lane_dir = rg_dir[lane_mask, :2]
+    if len(_lane_xy):
+        dists = np.hypot(_lane_xy[:, 0] - ego_x, _lane_xy[:, 1] - ego_y)
         k = min(K_ROAD, len(dists))
         top_k = np.argpartition(dists, k - 1)[:k]
         top_k = top_k[np.argsort(dists[top_k])]
         slot = STATE_DIM_BASE
         for ni in top_k:
-            dx = (lane_xy[ni, 0] - ego_x) / POS_SCALE
-            dy = (lane_xy[ni, 1] - ego_y) / POS_SCALE
-            state[slot]     =  dx * cos_h + dy * sin_h   # ego-frame x
-            state[slot + 1] = -dx * sin_h + dy * cos_h   # ego-frame y
-            state[slot + 2] =  lane_dir[ni, 0] * cos_h + lane_dir[ni, 1] * sin_h
-            state[slot + 3] = -lane_dir[ni, 0] * sin_h + lane_dir[ni, 1] * cos_h
+            dx = (_lane_xy[ni, 0] - ego_x) / POS_SCALE
+            dy = (_lane_xy[ni, 1] - ego_y) / POS_SCALE
+            state[slot]     =  dx * cos_h + dy * sin_h
+            state[slot + 1] = -dx * sin_h + dy * cos_h
+            state[slot + 2] =  _lane_dir[ni, 0] * cos_h + _lane_dir[ni, 1] * sin_h
+            state[slot + 3] = -_lane_dir[ni, 0] * sin_h + _lane_dir[ni, 1] * cos_h
             slot += 4
 
     # --- nearest valid traffic lights ---
-    tl_mask = (tl_valid == 1)
-    if tl_mask.any():
-        vtl_x, vtl_y, vtl_s = tl_x[tl_mask], tl_y[tl_mask], tl_state[tl_mask]
-        dists = np.hypot(vtl_x - ego_x, vtl_y - ego_y)
+    if _vtl_x is None:
+        tl_mask = (tl_valid == 1)
+        _vtl_x = tl_x[tl_mask]
+        _vtl_y = tl_y[tl_mask]
+        _vtl_s = tl_state[tl_mask]
+    if len(_vtl_x):
+        dists = np.hypot(_vtl_x - ego_x, _vtl_y - ego_y)
         k = min(K_TL, len(dists))
         top_k = np.argpartition(dists, k - 1)[:k]
         top_k = top_k[np.argsort(dists[top_k])]
         slot = STATE_DIM_BASE + K_ROAD * 4
         for ni in top_k:
-            dx = (vtl_x[ni] - ego_x) / POS_SCALE
-            dy = (vtl_y[ni] - ego_y) / POS_SCALE
+            dx = (_vtl_x[ni] - ego_x) / POS_SCALE
+            dy = (_vtl_y[ni] - ego_y) / POS_SCALE
             state[slot]     =  dx * cos_h + dy * sin_h
             state[slot + 1] = -dx * sin_h + dy * cos_h
-            state[slot + 2] = float(vtl_s[ni]) / 8.0   # normalise 0-8 → [0, 1]
+            state[slot + 2] = float(_vtl_s[ni]) / 8.0
             slot += 3
 
     return state
@@ -523,9 +550,15 @@ class WOMDOfflineRLDataset(Dataset):
                 tl_y     = sc["tl_y"][0].numpy().astype(np.float32)
                 tl_state = sc["tl_state"][0].numpy()
                 tl_valid = sc["tl_valid"][0].numpy()
-                # Per-timestep state: base state updates from future frames;
-                # roadgraph/TL features use t=0 ego frame (roadgraph is static,
-                # TL current-state is the only one available in WOMD).
+                # Pre-compute lane and TL masks once per scenario — roadgraph is
+                # static so the filtered arrays are reused across all timesteps.
+                lane_mask = (rg_valid == 1) & np.isin(rg_type, list(LANE_TYPES))
+                lane_xy   = rg_xyz[lane_mask, :2]
+                lane_dir  = rg_dir[lane_mask, :2]
+                tl_mask   = (tl_valid == 1)
+                vtl_x     = tl_x[tl_mask]
+                vtl_y     = tl_y[tl_mask]
+                vtl_s     = tl_state[tl_mask]
                 states = np.array([
                     build_map_state(
                         build_state_at_frame(fut[:, t, :], sdc_idx),
@@ -535,6 +568,8 @@ class WOMDOfflineRLDataset(Dataset):
                         float(fut[sdc_idx, t, 5]),
                         rg_xyz, rg_dir, rg_type, rg_valid,
                         tl_x, tl_y, tl_state, tl_valid,
+                        _lane_xy=lane_xy, _lane_dir=lane_dir,
+                        _vtl_x=vtl_x, _vtl_y=vtl_y, _vtl_s=vtl_s,
                     ) for t in range(T)
                 ], dtype=np.float32)
             else:
